@@ -24,6 +24,8 @@
 #include "mpu6050.h"
 #include "madgwick.h"
 #include "pid.h"
+#include "lowpass.h"
+#include "mixer.h"
 #include <stdio.h>
 #include <string.h>
 /* USER CODE END Includes */
@@ -76,6 +78,18 @@ float pitch_output = 0.0f; 		//Inner loop output
 PID_t pid_rate_yaw;
 float target_rate_yaw = 0.0f;
 float yaw_output = 0.0f;
+
+LowPass_t lpf_gyro_x;
+LowPass_t lpf_gyro_y;
+LowPass_t lpf_gyro_z;
+float gyro_x_filt = 0.0f;
+float gyro_y_filt = 0.0f;
+float gyro_z_filt = 0.0f;
+
+Motor_Output_t motor_outputs;
+RobotModel_t current_mode = MODE_AIR;					// Test mode: Air Mode
+uint8_t is_armed = 1;									// Test mode: Motor lock disabled
+float test_throttle = 1500.0f;							// Test mode: 50% throttle
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -155,6 +169,12 @@ int main(void)
 
   PID_Init(&pid_rate_yaw, 2.0f, 0.5f, 0.0f, -100.0f, 100.0f, 30.0f);
 
+  LowPass_Init(&lpf_gyro_x, 90.0f, 1000.0f);
+  LowPass_Init(&lpf_gyro_y, 90.0f, 1000.0f);
+  LowPass_Init(&lpf_gyro_z, 90.0f, 1000.0f);
+
+  Mixer_Init(&motor_outputs);
+
   DWT_Init();
   Madgwick_Init(&madgwick_data, 0.04f);
   HAL_TIM_Base_Start_IT(&htim6);
@@ -182,6 +202,10 @@ int main(void)
 		  uint32_t dwt_start = DWT->CYCCNT;
 	      float deg_to_rad = 3.14159265f / 180.0f;
 
+	      gyro_x_filt = LowPass_Update(&lpf_gyro_x, mpu_data.gyro_x_dps);
+	      gyro_y_filt = LowPass_Update(&lpf_gyro_y, mpu_data.gyro_y_dps);
+	      gyro_z_filt = LowPass_Update(&lpf_gyro_z, mpu_data.gyro_z_dps);
+
 	      Madgwick_Update(&madgwick_data,
 	          mpu_data.gyro_x_dps * deg_to_rad,
 	          mpu_data.gyro_y_dps * deg_to_rad,
@@ -192,13 +216,14 @@ int main(void)
 	          dt);
 
 	      target_rate_roll = PID_Update(&pid_angle_roll, 0.0F, madgwick_data.roll, dt);
-	      roll_output = PID_Update(&pid_rate_roll, target_rate_roll, mpu_data.gyro_x_dps, dt);
+	      roll_output = PID_Update(&pid_rate_roll, target_rate_roll, gyro_x_filt, dt);
 
 	      target_rate_pitch = PID_Update(&pid_angle_pitch, 0.0f, madgwick_data.pitch, dt);
-	      pitch_output = PID_Update(&pid_rate_pitch, target_rate_pitch, mpu_data.gyro_y_dps, dt);
+	      pitch_output = PID_Update(&pid_rate_pitch, target_rate_pitch, gyro_y_filt, dt);
 
-	      yaw_output = PID_Update(&pid_rate_yaw, target_rate_yaw, mpu_data.gyro_z_dps, dt);
+	      yaw_output = PID_Update(&pid_rate_yaw, target_rate_yaw, gyro_z_filt, dt);
 
+	      Mixer_Update(&motor_outputs, current_mode, test_throttle, roll_output, pitch_output, yaw_output, is_armed);
 
 	      uint32_t dwt_finish = DWT->CYCCNT;
 	      cycle_time =(dwt_finish - dwt_start) / (SystemCoreClock / 1000000UL);
@@ -213,10 +238,9 @@ int main(void)
 	            if (HAL_UART_GetState(&huart3) == HAL_UART_STATE_READY) {
 
 	                // Verileri kütüphanemizdeki çantamızdan (mpu_data) çekiyoruz
-	            	sprintf(tx_buffer, "R: %.1f | O_R: %.1f | P: %.1f | O_P: %.1f | Y: %.1f | O_Y: %.1f | CT: %lu us\r\n",
-	            	        madgwick_data.roll, roll_output,
-	            	        madgwick_data.pitch, pitch_output,
-	            	        madgwick_data.yaw, yaw_output,
+	            	sprintf(tx_buffer, "M1:%u | M2:%u | M3:%u | M4:%u | R:%.1f | P:%.1f | CT:%lu us\r\n",
+	            	        motor_outputs.m1, motor_outputs.m2, motor_outputs.m3, motor_outputs.m4,
+	            	        madgwick_data.roll, madgwick_data.pitch,
 	            	        cycle_time);
 	                HAL_UART_Transmit_IT(&huart3, (uint8_t*)tx_buffer, strlen(tx_buffer));
 	            }
