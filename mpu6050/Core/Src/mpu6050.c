@@ -24,7 +24,7 @@ uint8_t MPU6050_Init(I2C_HandleTypeDef *hi2c) {
 	HAL_I2C_Mem_Write(hi2c, MPU6050_ADDR, CONFIG_REG, 1, &temp_data, 1, 100);
 
 	// 3. Sample Rate (Örnekleme Hızı) Ayarı
-	// 0x04 değeri -> 1000 Hz / (1 + 4) = 200 Hz
+	// 0x04 değeri -> 1000 Hz
 	temp_data = 0x00;
 	HAL_I2C_Mem_Write(hi2c, MPU6050_ADDR, SMPLRT_DIV_REG, 1, &temp_data, 1, 100);
 

@@ -26,8 +26,10 @@
 #include "pid.h"
 #include "lowpass.h"
 #include "mixer.h"
+#include "state_machine.h"
 #include <stdio.h>
 #include <string.h>
+#include "crsf.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -50,6 +52,7 @@
 I2C_HandleTypeDef hi2c1;
 DMA_HandleTypeDef hdma_i2c1_rx;
 
+TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim6;
 
 UART_HandleTypeDef huart3;
@@ -87,9 +90,15 @@ float gyro_y_filt = 0.0f;
 float gyro_z_filt = 0.0f;
 
 Motor_Output_t motor_outputs;
-RobotModel_t current_mode = MODE_AIR;					// Test mode: Air Mode
+RobotModel_t current_mode = MODE_AIR;
 uint8_t is_armed = 1;									// Test mode: Motor lock disabled
 float test_throttle = 1500.0f;							// Test mode: 50% throttle
+
+FlightState_t state;
+uint8_t btn_prev = GPIO_PIN_RESET;
+
+CRSF_t crsf_data;
+uint8_t crsf_rx_buffer[CRSF_TOTAL_PACKAGE_SIZE];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -100,6 +109,7 @@ static void MX_DMA_Init(void);
 static void MX_USART3_UART_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_TIM6_Init(void);
+static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -150,6 +160,7 @@ int main(void)
   MX_USART3_UART_Init();
   MX_I2C1_Init();
   MX_TIM6_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
   if (MPU6050_Init(&hi2c1) == 1) {
         char *msg = "Sensör Basariyla Uyandirildi!\r\n";
@@ -159,7 +170,7 @@ int main(void)
         HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
     }
   MPU6050_Calibrate_Gyro(&hi2c1, &mpu_data);
-  telemetry_timer = HAL_GetTick();
+  telemetry_timer = HAL_GetTick();							//Hal delay kullanmamak icin
 
   PID_Init(&pid_angle_roll, 4.0f, 0.0f, 0.0f, -300.0f, 300.0f, 0.0f);
   PID_Init(&pid_angle_pitch, 4.0f, 0.0f, 0.0f, -300.0f, 300.0f, 0.0f);
@@ -175,9 +186,20 @@ int main(void)
 
   Mixer_Init(&motor_outputs);
 
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4);
+
+  CRSF_Init(&crsf_data);
+
+  State_Init(&state, 60.0f, 50, 10);
+
   DWT_Init();
   Madgwick_Init(&madgwick_data, 0.04f);
   HAL_TIM_Base_Start_IT(&htim6);
+
+  HAL_UARTEx_ReceiveToIdle_IT(&huart3, crsf_rx_buffer, CRSF_TOTAL_PACKAGE_SIZE);
 
   uint32_t last_dwt_time = DWT->CYCCNT;
   /* USER CODE END 2 */
@@ -193,6 +215,8 @@ int main(void)
 	  uint32_t current_time = HAL_GetTick();
 
 	  if (imu_flag == 1) {
+		  state.last_imu_tick = HAL_GetTick();
+
 		  imu_flag = 0;
 
 		  uint32_t current_dwt_time = DWT->CYCCNT;
@@ -215,16 +239,36 @@ int main(void)
 	          mpu_data.accel_z_g,
 	          dt);
 
-	      target_rate_roll = PID_Update(&pid_angle_roll, 0.0F, madgwick_data.roll, dt);
+	      CRSF_CheckFailsafe(&crsf_data);
+
+	      State_Update(&state, madgwick_data.roll, madgwick_data.pitch, dt,crsf_data.is_connected);
+
+	      if(state.mode == STATE_ARMED){
+	      target_rate_roll = PID_Update(&pid_angle_roll, crsf_data.roll, madgwick_data.roll, dt);
 	      roll_output = PID_Update(&pid_rate_roll, target_rate_roll, gyro_x_filt, dt);
 
-	      target_rate_pitch = PID_Update(&pid_angle_pitch, 0.0f, madgwick_data.pitch, dt);
+	      target_rate_pitch = PID_Update(&pid_angle_pitch, crsf_data.pitch, madgwick_data.pitch, dt);
 	      pitch_output = PID_Update(&pid_rate_pitch, target_rate_pitch, gyro_y_filt, dt);
 
+	      target_rate_yaw = crsf_data.yaw;
 	      yaw_output = PID_Update(&pid_rate_yaw, target_rate_yaw, gyro_z_filt, dt);
 
-	      Mixer_Update(&motor_outputs, current_mode, test_throttle, roll_output, pitch_output, yaw_output, is_armed);
+	      current_mode = (crsf_data.mode == 1) ? MODE_GROUND : MODE_AIR;
 
+	      Mixer_Update(&motor_outputs, current_mode, crsf_data.throttle, roll_output, pitch_output, yaw_output, (state.mode == STATE_ARMED));
+
+	      __HAL_TIM_SET_COMPARE(&htim3 , TIM_CHANNEL_1 , motor_outputs.m1);
+	      __HAL_TIM_SET_COMPARE(&htim3 , TIM_CHANNEL_2 , motor_outputs.m2);
+	      __HAL_TIM_SET_COMPARE(&htim3 , TIM_CHANNEL_3 , motor_outputs.m3);
+	      __HAL_TIM_SET_COMPARE(&htim3 , TIM_CHANNEL_4 , motor_outputs.m4);
+	      }
+	      else{
+	    	  __HAL_TIM_SET_COMPARE(&htim3 , TIM_CHANNEL_1 , 1000);
+	    	  __HAL_TIM_SET_COMPARE(&htim3 , TIM_CHANNEL_2 , 1000);
+	    	  __HAL_TIM_SET_COMPARE(&htim3 , TIM_CHANNEL_3 , 1000);
+	    	  __HAL_TIM_SET_COMPARE(&htim3 , TIM_CHANNEL_4 , 1000);
+
+	      }
 	      uint32_t dwt_finish = DWT->CYCCNT;
 	      cycle_time =(dwt_finish - dwt_start) / (SystemCoreClock / 1000000UL);
 	      }
@@ -235,16 +279,24 @@ int main(void)
 	            telemetry_timer = current_time; // Kronometreyi sıfırla
 
 	            // Verileri UART üzerinden bilgisayara gönder (Sadece hat boşsa)
-	            if (HAL_UART_GetState(&huart3) == HAL_UART_STATE_READY) {
+	            if (huart3.gState == HAL_UART_STATE_READY) {
 
 	                // Verileri kütüphanemizdeki çantamızdan (mpu_data) çekiyoruz
-	            	sprintf(tx_buffer, "M1:%u | M2:%u | M3:%u | M4:%u | R:%.1f | P:%.1f | CT:%lu us\r\n",
+	            	sprintf(tx_buffer, "RC:%d | TH:%.0f | AR:%d | MD:%d | M1:%u | M2:%u | M3:%u | M4:%u | R:%.1f | P:%.1f\r\n",
+	            	        crsf_data.is_connected, crsf_data.throttle, crsf_data.is_armed,
+	            	        current_mode,
 	            	        motor_outputs.m1, motor_outputs.m2, motor_outputs.m3, motor_outputs.m4,
-	            	        madgwick_data.roll, madgwick_data.pitch,
-	            	        cycle_time);
+	            	        madgwick_data.roll, madgwick_data.pitch);
 	                HAL_UART_Transmit_IT(&huart3, (uint8_t*)tx_buffer, strlen(tx_buffer));
 	            }
 	        }
+
+	  if(crsf_data.is_armed == 1){
+		  State_Arm(&state, crsf_data.is_connected, crsf_data.throttle);
+	  }
+	  else{
+		  State_Disarm(&state);
+	  }
   }
   /* USER CODE END 3 */
 }
@@ -357,6 +409,77 @@ static void MX_I2C1_Init(void)
 }
 
 /**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+
+  /* USER CODE BEGIN TIM3_Init 0 */
+
+  /* USER CODE END TIM3_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  /* USER CODE BEGIN TIM3_Init 1 */
+
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 119;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 2499;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
+
+  /* USER CODE END TIM3_Init 2 */
+  HAL_TIM_MspPostInit(&htim3);
+
+}
+
+/**
   * @brief TIM6 Initialization Function
   * @param None
   * @retval None
@@ -465,29 +588,38 @@ static void MX_DMA_Init(void)
   */
 static void MX_GPIO_Init(void)
 {
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
 /* USER CODE BEGIN MX_GPIO_Init_1 */
 /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
-  __HAL_RCC_GPIOD_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+
+  /*Configure GPIO pin : PC13 */
+  GPIO_InitStruct.Pin = GPIO_PIN_13;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
 /* USER CODE BEGIN MX_GPIO_Init_2 */
 /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){				//TIM period callback'i
 	if (htim->Instance == TIM6)
 		if (HAL_I2C_GetState(&hi2c1) == HAL_I2C_STATE_READY){
-				MPU6050_Read_All_DMA(&hi2c1); // timer tetiklendiginde veri oku
+				MPU6050_Read_All_DMA(&hi2c1); // timer tetiklendiginde hat dolu değilse veri oku
 		}
 }
 extern uint8_t mpu_rx_buffer[32];
-void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c){
+void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c){					//I2C Hafıza Okuma İşlemi Tamamlandı Fonksiyonu
 	if (hi2c->Instance == I2C1){ // Gelen kargo I2C1'e (MPU6050) mi ait?
-		SCB_InvalidateDCache_by_Addr((uint32_t*)mpu_rx_buffer, 32);
+		SCB_InvalidateDCache_by_Addr((uint32_t*)mpu_rx_buffer, 32);   		//DCache (eski veriyi sil)
 		MPU6050_Process_DMA_Data(&mpu_data);
 		imu_flag = 1;
 	}
@@ -498,6 +630,22 @@ void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c) {
         // Hattın kilitlendiğini anlarsak I2C'yi kapatıp yeniden kuruyoruz
         HAL_I2C_DeInit(hi2c);
         MX_I2C1_Init();
+    }
+}
+
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {
+    if (huart->Instance == USART3) {
+        if (Size == CRSF_TOTAL_PACKAGE_SIZE) {
+            CRSF_ProcessPacket(&crsf_data, crsf_rx_buffer);
+        }
+        HAL_UARTEx_ReceiveToIdle_IT(&huart3, crsf_rx_buffer, CRSF_TOTAL_PACKAGE_SIZE);
+    }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
+    if (huart->Instance == USART3) {
+        __HAL_UART_CLEAR_OREFLAG(huart);
+        HAL_UARTEx_ReceiveToIdle_IT(&huart3, crsf_rx_buffer, CRSF_TOTAL_PACKAGE_SIZE);
     }
 }
 /* USER CODE END 4 */
