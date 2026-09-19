@@ -52,6 +52,8 @@
 I2C_HandleTypeDef hi2c1;
 DMA_HandleTypeDef hdma_i2c1_rx;
 
+IWDG_HandleTypeDef hiwdg1;
+
 TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim6;
 
@@ -110,6 +112,7 @@ static void MX_USART3_UART_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_TIM6_Init(void);
 static void MX_TIM3_Init(void);
+static void MX_IWDG1_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -162,6 +165,7 @@ int main(void)
   MX_TIM6_Init();
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
+  __HAL_DBGMCU_FREEZE_IWDG1();
   if (MPU6050_Init(&hi2c1) == 1) {
         char *msg = "Sensör Basariyla Uyandirildi!\r\n";
         HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
@@ -202,6 +206,8 @@ int main(void)
   HAL_UARTEx_ReceiveToIdle_IT(&huart3, crsf_rx_buffer, CRSF_TOTAL_PACKAGE_SIZE);
 
   uint32_t last_dwt_time = DWT->CYCCNT;
+
+  MX_IWDG1_Init();								//Init watchdog
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -271,6 +277,8 @@ int main(void)
 	      }
 	      uint32_t dwt_finish = DWT->CYCCNT;
 	      cycle_time =(dwt_finish - dwt_start) / (SystemCoreClock / 1000000UL);
+
+	      HAL_IWDG_Refresh(&hiwdg1);							// 1kHz loop alive signal (150ms timeout)
 	      }
 
 
@@ -282,11 +290,12 @@ int main(void)
 	            if (huart3.gState == HAL_UART_STATE_READY) {
 
 	                // Verileri kütüphanemizdeki çantamızdan (mpu_data) çekiyoruz
-	            	sprintf(tx_buffer, "RC:%d | TH:%.0f | AR:%d | MD:%d | M1:%u | M2:%u | M3:%u | M4:%u | R:%.1f | P:%.1f\r\n",
+	            	sprintf(tx_buffer, "RC:%d | TH:%.0f | AR:%d | MD:%d | M1:%u | M2:%u | M3:%u | M4:%u | R:%.1f | P:%.1f | CYC:%lu us\r\n",
 	            	        crsf_data.is_connected, crsf_data.throttle, crsf_data.is_armed,
 	            	        current_mode,
 	            	        motor_outputs.m1, motor_outputs.m2, motor_outputs.m3, motor_outputs.m4,
-	            	        madgwick_data.roll, madgwick_data.pitch);
+	            	        madgwick_data.roll, madgwick_data.pitch,
+	            	        cycle_time);
 	                HAL_UART_Transmit_IT(&huart3, (uint8_t*)tx_buffer, strlen(tx_buffer));
 	            }
 	        }
@@ -323,9 +332,10 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_LSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_DIV1;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
   RCC_OscInitStruct.PLL.PLLM = 4;
@@ -405,6 +415,35 @@ static void MX_I2C1_Init(void)
   /* USER CODE BEGIN I2C1_Init 2 */
 
   /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
+  * @brief IWDG1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_IWDG1_Init(void)
+{
+
+  /* USER CODE BEGIN IWDG1_Init 0 */
+
+  /* USER CODE END IWDG1_Init 0 */
+
+  /* USER CODE BEGIN IWDG1_Init 1 */
+
+  /* USER CODE END IWDG1_Init 1 */
+  hiwdg1.Instance = IWDG1;
+  hiwdg1.Init.Prescaler = IWDG_PRESCALER_32;
+  hiwdg1.Init.Window = 4095;
+  hiwdg1.Init.Reload = 150;
+  if (HAL_IWDG_Init(&hiwdg1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN IWDG1_Init 2 */
+
+  /* USER CODE END IWDG1_Init 2 */
 
 }
 
